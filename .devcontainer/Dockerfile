@@ -6,4 +6,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps via pip (not apt)
-RUN pip install --no-cache-dir pymupdf python-arango pymupdf4llm pathlib
+RUN pip install --no-cache-dir pymupdf python-arango pymupdf4llm pathlib python-dotenv
