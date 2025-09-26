@@ -83,7 +83,7 @@ def ingest_directory(
     directory: Path,
     collection_name: str = "documents_markdown",
 ):
-    hosts = get_env("ARANGO_HOSTS", "http://host.docker.internal:8529")
+    hosts = get_env("ARANGO_HOSTS", "http://arangodb:8529")
     root_user = get_env("ARANGO_ROOT_USER", "root")
     root_password = get_env("ROOT_DB_PASSWORD", "")
     db_name = get_env("ARANGO_DB_NAME", "sample_db")
