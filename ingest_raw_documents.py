@@ -86,7 +86,7 @@ def ingest_directory(
     hosts = get_env("ARANGO_HOSTS", "http://arangodb:8529")
     root_user = get_env("ARANGO_ROOT_USER", "root")
     root_password = get_env("ROOT_DB_PASSWORD", "")
-    db_name = get_env("ARANGO_DB_NAME", "sample_db")
+    db_name = get_env("ARANGO_DB_NAME", "winterresearch")
 
     if not root_password:
         print("ERROR: ROOT_DB_PASSWORD is not set.")
