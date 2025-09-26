@@ -3,17 +3,24 @@ import sys
 import re
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 import itertools
-from typing import Iterable, Optional, Tuple, Dict, Any, List
+from typing import Iterable, Optional, Tuple, Dict, Any, List, Set
 
 from arango import ArangoClient
 from arango.graph import Graph
 from dotenv import load_dotenv
 
-# KG generation
-from kg_gen import KGGen
 import json
 import requests
+
+from kg_gen import KGGen
+from kg_gen.models import Graph as KGGraph
+
+try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
 
 load_dotenv()
 
@@ -81,7 +88,30 @@ class GraphCollections:
     edge_col: str = "kg_edges"
 
 
-def ensure_graph(db, cols: GraphCollections) -> Graph:
+def ensure_graph(db, cols: GraphCollections, *, fresh: bool = True, debug: bool = False) -> Graph:
+    if fresh and db.has_graph(cols.graph_name):
+        if debug:
+            print(f"Resetting existing graph '{cols.graph_name}' for a fresh run…")
+        try:
+            db.delete_graph(cols.graph_name, ignore_missing=True, drop_collections=True)
+        except Exception as exc:
+            print(f"ERROR: Unable to delete existing graph '{cols.graph_name}': {exc}")
+            raise
+
+    if fresh:
+        # Ensure we don't keep stale collections when re-initializing the graph.
+        for cname in (cols.vertex_col, cols.edge_col):
+            if db.has_collection(cname):
+                if debug:
+                    print(f"Deleting stale collection '{cname}' before rebuild")
+                try:
+                    db.delete_collection(cname, ignore_missing=True)
+                except Exception as exc:
+                    print(f"ERROR: Unable to delete existing collection '{cname}': {exc}")
+                    raise
+    elif debug:
+        print(f"Reusing existing graph '{cols.graph_name}' and related collections")
+
     # Ensure collections
     if not db.has_collection(cols.vertex_col):
         db.create_collection(cols.vertex_col)
@@ -93,14 +123,14 @@ def ensure_graph(db, cols: GraphCollections) -> Graph:
     # Ensure helpful indexes
     try:
         v = db.collection(cols.vertex_col)
-        # Unique hash id is inherent via _key; also add non-unique index on 'key' for search/display
+        # Unique hash id is inherent via _key; also add non-unique index on 'label' for search/display
         try:
             # New API (avoids deprecation warning)
-            v.add_index({"type": "persistent", "fields": ["key"]})
+            v.add_index({"type": "persistent", "fields": ["label"]})
         except Exception:
             # Fallback to legacy helpers
             try:
-                v.add_persistent_index(["key"])  # ignore if already exists
+                v.add_persistent_index(["label"])  # ignore if already exists
             except Exception:
                 pass
     except Exception:
@@ -124,37 +154,40 @@ def ensure_graph(db, cols: GraphCollections) -> Graph:
                     e.add_hash_index(["_from", "_to", "relation", "doc_key"], unique=True)
                 except Exception:
                     pass
+        try:
+            e.add_index({"type": "persistent", "fields": ["relation"]})
+        except Exception:
+            try:
+                e.add_persistent_index(["relation"])
+            except Exception:
+                pass
     except Exception:
         pass
 
     # Ensure graph
-    if db.has_graph(cols.graph_name):
-        g = db.graph(cols.graph_name)
-        # Ensure edge definition exists
-        if cols.edge_col not in [ed["edge_collection"] for ed in g.edge_definitions()]:
-            g.create_edge_definition(
-                edge_collection=cols.edge_col,
-                from_vertex_collections=[cols.vertex_col],
-                to_vertex_collections=[cols.vertex_col],
-            )
-    else:
+    if not db.has_graph(cols.graph_name):
         g = db.create_graph(cols.graph_name)
+        print(f"Created graph: {cols.graph_name}")
+    else:
+        g = db.graph(cols.graph_name)
+
+    # Ensure edge definition exists (fresh runs will re-create it automatically)
+    if cols.edge_col not in [ed["edge_collection"] for ed in g.edge_definitions()]:
         g.create_edge_definition(
             edge_collection=cols.edge_col,
             from_vertex_collections=[cols.vertex_col],
             to_vertex_collections=[cols.vertex_col],
         )
-        print(f"Created graph: {cols.graph_name}")
 
     return g
 
 
 # -----------------------------
-# KGGen setup
+# LLM setup
 # -----------------------------
 
 def configure_llm_env() -> None:
-    # Configure OpenAI-compatible base URL for LiteLLM so KGGen routes via LiteLLM.
+    # Configure OpenAI-compatible base URL for LiteLLM so downstream LLM calls route consistently.
     _base_url = os.getenv("LITELLM_BASE_URL", "http://host.docker.internal:4000")
     os.environ.setdefault("OPENAI_API_BASE", _base_url)
     os.environ.setdefault("OPENAI_BASE_URL", _base_url)
@@ -182,33 +215,232 @@ def get_available_ollama_models() -> List[str]:
         return []
 
 
-def make_kggen(model: Optional[str] = None, temperature: float = 0.0) -> KGGen:
+def resolve_primary_model(model: Optional[str] = None) -> str:
     configure_llm_env()
-    # Choose a good default model based on what Ollama has locally
-    model = model or os.getenv("KGGEN_MODEL")
-    if not model:
-        avail = set(get_available_ollama_models())
-        # Preference order (instruction-tuned first)
-        candidates = [
-            "ollama_chat/qwen2.5:14b-instruct",
-            "ollama_chat/qwen2.5:7b-instruct",
-            "ollama_chat/llama3.1:8b",
-            "ollama_chat/gpt-oss:20b",
-            "ollama_chat/llama3.2:3b",
-        ]
-        # Map to base tag names present in Ollama list (strip provider prefix)
-        def is_present(c: str) -> bool:
-            tag = c.split("/", 1)[1] if "/" in c else c
-            return tag in avail
-        chosen = next((c for c in candidates if is_present(c)), None)
-        model = chosen or "ollama_chat/llama3.2:3b"
-    # When using LiteLLM + Ollama, KGGen will rely on environment variables
-    return KGGen(
+    if model:
+        return model
+    env_model = os.getenv("KGGEN_MODEL")
+    if env_model:
+        return env_model
+    avail = set(get_available_ollama_models())
+    candidates = [
+        "ollama_chat/qwen2.5:14b-instruct",
+        "ollama_chat/qwen2.5:7b-instruct",
+        "ollama_chat/llama3.1:8b",
+        "ollama_chat/gpt-oss:20b",
+        "ollama_chat/llama3.2:3b",
+    ]
+    def is_present(c: str) -> bool:
+        tag = c.split("/", 1)[1] if "/" in c else c
+        return tag in avail
+    chosen = next((c for c in candidates if is_present(c)), None)
+    return chosen or "ollama_chat/llama3.2:3b"
+
+
+def make_clusterer(model: str, temperature: float = 0.0) -> KGGen:
+    configure_llm_env()
+    cluster = KGGen(
         model=model,
         temperature=temperature,
         api_base=os.getenv("OLLAMA_BASE_URL", ""),
         api_key=os.getenv("LITELLM_MASTER_KEY") or os.getenv("LITELLM_API_KEY"),
     )
+    try:
+        cluster.dspy.settings.configure(adapter=cluster.dspy.ChatAdapter())
+    except Exception:
+        pass
+    return cluster
+
+
+def _ollama_generate(
+    *,
+    base_url: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    timeout: int,
+) -> str:
+    # Flatten messages into a single prompt for the legacy generate endpoint.
+    convo = []
+    for msg in messages:
+        role = msg.get("role", "user").strip().upper()
+        convo.append(f"{role}: {msg.get('content', '')}")
+    convo.append("ASSISTANT:")
+    prompt = "\n".join(convo)
+    url = f"{base_url}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    content = data.get("response")
+    if not isinstance(content, str):
+        raise ValueError("Ollama generate response missing 'response' text")
+    return content
+
+
+def _ollama_chat(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.0,
+    timeout: int = 120,
+) -> str:
+    # Allow callers to pass provider-prefixed names (e.g. "ollama_chat/qwen") while Ollama expects bare model id.
+    model_id = model.split("/", 1)[1] if "/" in model else model
+    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    chat_url = f"{base}/api/chat"
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+        },
+    }
+    try:
+        resp = requests.post(chat_url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        message = data.get("message", {})
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("Ollama chat response missing assistant content")
+        return content
+    except requests.HTTPError as http_err:
+        status = http_err.response.status_code if http_err.response is not None else None
+        if status == 404:
+            # Older Ollama versions expose only /api/generate; fall back to that path.
+            return _ollama_generate(
+                base_url=base,
+                model=model_id,
+                messages=messages,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        raise
+
+
+def _parse_kg_json(raw: str) -> Dict[str, Any]:
+    text = raw.strip()
+    for candidate in (text, repair_json(text) if repair_json else None):
+        if not candidate:
+            continue
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            continue
+    # Try to locate JSON object substring
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        snippet = m.group(0)
+        for candidate in (snippet, repair_json(snippet) if repair_json else None):
+            if not candidate:
+                continue
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                continue
+    raise ValueError("Unable to parse JSON payload from LLM response")
+
+
+def extract_kg_with_model(
+    *,
+    model: str,
+    input_text: str,
+    context: str,
+    temperature: float = 0.0,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "You build concise knowledge graphs. "
+        "Return only JSON with keys 'entities' (list of unique strings) and 'relations' "
+        "(each object must include subject, predicate, object as strings)."
+    )
+    user_prompt = (
+        f"Document: {context or 'unknown'}\n"
+        "Extract key entities and directed relations appearing in the document. "
+        "Prefer meaningful predicates in snake_case. Avoid duplicates.\n"
+        "Text:\n"
+        f"""{input_text}"""
+    )
+    content = _ollama_chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+    )
+    if debug:
+        snippet = content[:200]
+        print(f"    Raw LLM output from {model}: {snippet}{'…' if len(content) > 200 else ''}")
+    data = _parse_kg_json(content)
+    entities = data.get("entities") or []
+    relations = data.get("relations") or []
+    if not isinstance(entities, list):
+        entities = []
+    if not isinstance(relations, list):
+        relations = []
+    # Normalize relation tuples
+    cleaned_relations: List[Tuple[str, str, str]] = []
+    for rel in relations:
+        if isinstance(rel, dict):
+            subj = normalize_entity(rel.get("subject") or rel.get("source"))
+            pred = normalize_entity(rel.get("predicate") or rel.get("relation"))
+            obj = normalize_entity(rel.get("object") or rel.get("target"))
+            if subj and pred and obj:
+                cleaned_relations.append((subj, pred, obj))
+        elif isinstance(rel, (list, tuple)) and len(rel) >= 3:
+            subj = normalize_entity(rel[0])
+            pred = normalize_entity(rel[1])
+            obj = normalize_entity(rel[2])
+            if subj and pred and obj:
+                cleaned_relations.append((subj, pred, obj))
+    cleaned_entities: List[str] = []
+    for ent in entities:
+        ne = normalize_entity(ent)
+        if ne:
+            cleaned_entities.append(ne)
+    return {"entities": cleaned_entities, "relations": cleaned_relations}
+
+
+def try_generate_kg(
+    input_text: str,
+    context: str,
+    models: List[str],
+    *,
+    temperature: float = 0.0,
+    debug: bool = False,
+) -> Optional[Dict[str, Any]]:
+    for model in models:
+        try:
+            if debug:
+                print(f"    Generating KG with model '{model}'")
+            result = extract_kg_with_model(
+                model=model,
+                input_text=input_text,
+                context=context,
+                temperature=temperature,
+                debug=debug,
+            )
+            if result.get("entities") or result.get("relations"):
+                return result
+        except Exception as exc:
+            if debug:
+                print(f"    Model '{model}' failed: {exc}")
+            continue
+    return None
 
 
 # -----------------------------
@@ -244,28 +476,6 @@ def chunk_text(text: str, max_chars: int) -> List[str]:
             for i in range(0, len(c), max_chars):
                 fixed.append(c[i : i + max_chars])
     return fixed
-
-
-def try_generate_kg(kg: KGGen, input_text: str, context: str, model_fallbacks: List[str]) -> Optional[Any]:
-    """Try generating a KG; on failure, optionally retry with fallback models.
-
-    Returns the kg_graph object or None if all attempts fail.
-    """
-    try:
-        return kg.generate(input_data=input_text, context=context)
-    except Exception:
-        pass
-
-    # Retry with fallback models
-    for m in model_fallbacks:
-        try:
-            alt = make_kggen(model=m)
-            return alt.generate(input_data=input_text, context=context)
-        except Exception:
-            continue
-    return None
-
-
 # -----------------------------
 # Normalization helpers
 # -----------------------------
@@ -338,6 +548,104 @@ def normalize_relation(r: Any) -> Optional[Tuple[str, str, str]]:
 
 
 # -----------------------------
+# Relation fallbacks
+# -----------------------------
+
+def classify_relation_heuristic(a: str, b: str, sentence: str) -> Tuple[str, str, str]:
+    """Lightweight heuristic for directional relation inference between two entities."""
+
+    s_lc = sentence.lower()
+    a_lc, b_lc = a.lower(), b.lower()
+    pa = s_lc.find(a_lc)
+    pb = s_lc.find(b_lc)
+    if pa == -1 or pb == -1:
+        return (a, "associated_with", b)
+
+    first, second = (a, b) if pa <= pb else (b, a)
+    pf, ps = (pa, pb) if pa <= pb else (pb, pa)
+    seg = s_lc[pf + len(first.lower()): ps]
+
+    forward_map = {
+        "causes": "causes",
+        "cause": "causes",
+        "leads to": "leads_to",
+        "lead to": "leads_to",
+        "results in": "results_in",
+        "produces": "produces",
+        "increases": "increases",
+        "increase": "increases",
+        "raises": "increases",
+        "improves": "improves",
+        "boosts": "promotes",
+        "promotes": "promotes",
+        "drives": "drives",
+        "contributes to": "contributes_to",
+        "affects": "affects",
+        "influences": "influences",
+    }
+    for phrase, pred in forward_map.items():
+        if phrase in seg:
+            return (first, pred, second)
+
+    reverse_map = {
+        "caused by": "causes",
+        "driven by": "drives",
+        "influenced by": "influences",
+        "increased by": "increases",
+        "reduced by": "decreases",
+        "decreased by": "decreases",
+        "lowered by": "decreases",
+        "due to": "causes",
+    }
+    for phrase, pred in reverse_map.items():
+        if phrase in seg:
+            return (second, pred, first)
+
+    decrease_map = {
+        "reduces": "decreases",
+        "reduce": "decreases",
+        "decreases": "decreases",
+        "decrease": "decreases",
+        "lowers": "decreases",
+        "mitigates": "mitigates",
+        "prevents": "prevents",
+    }
+    for phrase, pred in decrease_map.items():
+        if phrase in seg:
+            return (first, pred, second)
+
+    assoc_phrases = ["associated with", "correlated with", "linked to", "relates to"]
+    if any(p in s_lc for p in assoc_phrases):
+        return (first, "associated_with", second)
+
+    if "part of" in seg or "component of" in seg:
+        return (first, "part_of", second)
+
+    return (first, "associated_with", second)
+
+
+def _chunked(seq: List[Any], size: int) -> Iterable[List[Any]]:
+    step = max(size, 1)
+    for idx in range(0, len(seq), step):
+        yield seq[idx : idx + step]
+
+
+def infer_relations_with_llm(
+    candidates: List[Dict[str, str]],
+    *,
+    doc_label: str,
+    max_pairs: int,
+    temperature: float = 0.0,
+    debug: bool = False,
+) -> List[Tuple[str, str, str]]:
+    """LLM inference disabled; placeholder retains signature so callers remain intact."""
+
+    if debug and candidates:
+        print("    LLM fallback disabled; skipping")
+    return []
+
+
+# -----------------------------
 # Persistence
 # -----------------------------
 
@@ -348,8 +656,8 @@ def upsert_entities(db, vertex_col: str, labels: Iterable[str]) -> Dict[str, str
         if not label:
             continue
         key = stable_key("e", label.lower())
-        # Store human-readable value under 'key' field to match requested schema
-        doc = {"_key": key, "key": label}
+        # Store human-readable value alongside Arango _key for display
+        doc = {"_key": key, "label": label}
         try:
             col.insert(doc, overwrite=True)  # upsert
         except Exception:
@@ -402,6 +710,8 @@ def process_documents(
     graph_name: str = "knowledge_graph",
     vertex_col: str = "kg_entities",
     edge_col: str = "kg_edges",
+    reuse_graph: bool = False,
+    debug: bool = False,
     only_unprocessed: bool = False,
     limit: Optional[int] = None,
     max_chars: Optional[int] = None,
@@ -411,11 +721,41 @@ def process_documents(
     retry_models: Optional[str] = None,
     fallback_cooccurrence: bool = True,
     max_cooc_pairs: int = 300,
+    debug_cooccurrence: bool = False,
+    cluster_graph_enabled: bool = True,
+    cluster_model: Optional[str] = None,
 ) -> None:
     cfg = get_arango_config()
     db = get_db(cfg)
+
+    # When not reusing, create fresh collection/graph names per run.
+    if not reuse_graph:
+        suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        base_graph, base_vertex, base_edge = graph_name, vertex_col, edge_col
+        graph_name = f"{graph_name}_{suffix}"
+        vertex_col = f"{vertex_col}_{suffix}"
+        edge_col = f"{edge_col}_{suffix}"
+        print(
+            "Creating new graph resources:" 
+            f" graph='{graph_name}' vertices='{vertex_col}' edges='{edge_col}'"
+        )
+        if debug:
+            print(
+                f"  Derived from base names graph='{base_graph}', vertex='{base_vertex}', edge='{base_edge}'"
+            )
+
     cols = GraphCollections(graph_name=graph_name, vertex_col=vertex_col, edge_col=edge_col)
-    ensure_graph(db, cols)
+    ensure_graph(db, cols, fresh=not reuse_graph, debug=debug)
+
+    if debug:
+        print(
+            "Starting KG build: source_collection="
+            f"{source_collection}, reuse_graph={reuse_graph}, "
+            f"fallback_cooccurrence={fallback_cooccurrence}, limit={limit if limit is not None else 'all'}"
+        )
+        print(
+            f"  Active graph setup: graph='{graph_name}', vertices='{vertex_col}', edges='{edge_col}'"
+        )
 
     if not db.has_collection(source_collection):
         print(f"ERROR: Source collection '{source_collection}' not found in DB '{cfg.db_name}'.")
@@ -438,7 +778,7 @@ def process_documents(
 
     cursor = db.aql.execute(aql, batch_size=50)
 
-    kg = make_kggen(model=model)
+    primary_model = resolve_primary_model(model)
     fallback_models: List[str] = []
     if retry_models:
         fallback_models = [m.strip() for m in retry_models.split(",") if m.strip()]
@@ -455,7 +795,26 @@ def process_documents(
     def present(m: str) -> bool:
         tag = m.split("/", 1)[1] if "/" in m else m
         return tag in avail
-    fallback_models = [m for m in fallback_models if present(m)]
+    fallback_models = [m for m in fallback_models if present(m) and m != primary_model]
+    models_to_try: List[str] = []
+    for candidate in [primary_model] + fallback_models:
+        if candidate and candidate not in models_to_try:
+            models_to_try.append(candidate)
+    if debug:
+        print(f"Model order: {', '.join(models_to_try)}")
+
+    clusterer = None
+    clusterer_model = None
+    if cluster_graph_enabled and models_to_try:
+        clusterer_model = cluster_model or os.getenv("KG_CLUSTER_MODEL") or models_to_try[0]
+        try:
+            clusterer = make_clusterer(clusterer_model)
+            if debug:
+                print(f"  Clustering enabled via KGGen model '{clusterer_model}'")
+        except Exception as exc:
+            clusterer = None
+            if debug:
+                print(f"  Clustering disabled: unable to initialize KGGen ({exc})")
 
     processed = 0
     for doc in cursor:
@@ -464,50 +823,112 @@ def process_documents(
         md_text = doc.get("md") or ""
         if max_chars and len(md_text) > max_chars:
             md_text = md_text[:max_chars]
+            if debug:
+                print(f"  Truncated document '{filename}' to {max_chars} characters")
 
         print(f"Processing doc key={doc_key} file='{filename}' (chars={len(md_text)}) …")
+        if debug:
+            sha = doc.get("sha", doc.get("sha256_pdf"))
+            print(
+                f"  Document details: sha={sha or 'n/a'}, retry_models={len(fallback_models)}"
+            )
         kg_graph = None
         attempts = 0
         # Try full text first, then chunked retries
-        kg_graph = try_generate_kg(kg, md_text, filename, fallback_models)
+        kg_graph = try_generate_kg(
+            md_text,
+            filename,
+            models_to_try,
+            temperature=0.0,
+            debug=debug,
+        )
         attempts += 1
         if kg_graph is None and chunk_size and len(md_text) > chunk_size:
-            print("  Falling back to chunked extraction…")
+            chunk_count_msg = f"  Falling back to chunked extraction…"
+            if debug:
+                print(f"{chunk_count_msg} (chunk_size={chunk_size})")
+            else:
+                print(chunk_count_msg)
             chunks = chunk_text(md_text, chunk_size)
-            merged_entities: List[Any] = []
-            merged_relations: List[Any] = []
+            merged_entities: List[str] = []
+            merged_relations: List[Tuple[str, str, str]] = []
             for idx, ch in enumerate(chunks, start=1):
+                if debug:
+                    print(
+                        f"    Chunk {idx}/{len(chunks)} (chars={len(ch)})"
+                    )
                 if retries and attempts >= (1 + retries * len(chunks)):
                     break
-                sub = try_generate_kg(kg, ch, f"{filename} (part {idx}/{len(chunks)})", fallback_models)
+                sub = try_generate_kg(
+                    ch,
+                    f"{filename} (part {idx}/{len(chunks)})",
+                    models_to_try,
+                    temperature=0.0,
+                    debug=debug,
+                )
                 attempts += 1
                 if sub is None:
+                    if debug:
+                        print(f"    Chunk {idx} returned no graph")
                     continue
-                merged_entities.extend(getattr(sub, "entities", []) or [])
-                merged_relations.extend(getattr(sub, "relations", []) or getattr(sub, "edges", []) or [])
+                merged_entities.extend(sub.get("entities", []) or [])
+                merged_relations.extend(sub.get("relations", []) or [])
             if merged_entities or merged_relations:
-                class SimpleKG:
-                    pass
-                tmp = SimpleKG()
-                tmp.entities = merged_entities
-                tmp.relations = merged_relations
-                tmp.edges = getattr(kg_graph, "edges", []) if kg_graph else []
-                kg_graph = tmp
+                kg_graph = {"entities": merged_entities, "relations": merged_relations}
+                if debug:
+                    print(
+                        f"  Chunk merge produced entities={len(merged_entities)} relations={len(merged_relations)}"
+                    )
         if kg_graph is None:
-            print(f"  KGGen failed for {doc_key}: all attempts exhausted.")
+            print(f"  LLM extraction failed for {doc_key}: all attempts exhausted.")
+            if debug:
+                print("  Skipping document due to extraction failure")
             continue
 
         # Collect entities
-        raw_entities = getattr(kg_graph, "entities", []) or []
-        entities: List[str] = []
+        raw_entities = kg_graph.get("entities", []) or []
+        raw_relations = kg_graph.get("relations", []) or []
+        normalized_entities: List[str] = []
         for e in raw_entities:
             ne = normalize_entity(e)
             if ne:
-                entities.append(ne)
+                normalized_entities.append(ne)
+        normalized_relations: List[Tuple[str, str, str]] = []
+        for r in raw_relations:
+            tr = normalize_relation(r)
+            if tr:
+                normalized_relations.append(tr)
+        if debug:
+            print(
+                f"  LLM output summary: raw_entities={len(normalized_entities)} raw_relations={len(normalized_relations)}"
+            )
+
+        if cluster_graph_enabled and clusterer and (normalized_entities or normalized_relations):
+            try:
+                kg_input = KGGraph(
+                    entities=set(normalized_entities),
+                    edges={rel[1] for rel in normalized_relations},
+                    relations=set(normalized_relations),
+                )
+                clustered = clusterer.cluster(kg_input, context=filename)
+                if debug:
+                    print(
+                        "  Clustered entities {:d}→{:d}, relations {:d}→{:d}".format(
+                            len(normalized_entities),
+                            len(clustered.entities),
+                            len(normalized_relations),
+                            len(clustered.relations),
+                        )
+                    )
+                normalized_entities = list(clustered.entities)
+                normalized_relations = list(clustered.relations)
+            except Exception as exc:
+                if debug:
+                    print(f"  Clustering failed: {exc}")
         # Unique-ify while preserving case (dedupe by lowercase)
         seen_lc = set()
         uniq_entities: List[str] = []
-        for label in entities:
+        for label in normalized_entities:
             lc = label.lower()
             if lc in seen_lc:
                 continue
@@ -518,59 +939,117 @@ def process_documents(
         key_by_label = upsert_entities(db, vertex_col, uniq_entities)
 
         # Collect relations (triples)
-        raw_relations = getattr(kg_graph, "relations", []) or []
-        triples: List[Tuple[str, str, str]] = []
-        for r in raw_relations:
-            tr = normalize_relation(r)
-            if tr:
-                triples.append(tr)
-
-        # As a fallback, derive from edges if relations empty
-        if not triples:
-            raw_edges = getattr(kg_graph, "edges", []) or []
-            for ed in raw_edges:
-                if isinstance(ed, (list, tuple)) and len(ed) >= 2:
-                    s = normalize_entity(ed[0])
-                    o = normalize_entity(ed[1])
-                    p = normalize_entity(ed[2]) if len(ed) >= 3 else "related_to"
-                    if s and p and o:
-                        triples.append((s, p, o))
-                elif isinstance(ed, dict):
-                    tr = normalize_relation(ed)
-                    if tr:
-                        triples.append(tr)
+        triples: List[Tuple[str, str, str]] = list(normalized_relations)
 
         # Co-occurrence fallback if still empty
         if not triples and fallback_cooccurrence and uniq_entities:
+            if debug and not debug_cooccurrence:
+                print("  Triggering co-occurrence fallback (enable --debug-cooc for details)")
             sent_split = re.split(r"(?<=[\.!?])\s+|\n{2,}", md_text)
-            added_pairs = set()
-            total_added = 0
             uniq_lc_map = {e.lower(): e for e in uniq_entities}
             uniq_lc = list(uniq_lc_map.keys())
+
+            candidates: List[Dict[str, str]] = []
+            heuristics_by_pair: Dict[frozenset[str], Tuple[str, str, str]] = {}
+            pair_seen: Set[frozenset[str]] = set()
+            sentence_considered = 0
+            sentence_with_pairs = 0
+
             for sent in sent_split:
-                if total_added >= max_cooc_pairs:
+                if max_cooc_pairs and len(candidates) >= max_cooc_pairs:
                     break
+                sentence = sent.strip()
+                if not sentence:
+                    continue
+                s_lc = sentence.lower()
                 present: List[str] = []
-                s_lc = sent.lower()
                 for lc in uniq_lc:
                     if lc in s_lc:
                         present.append(uniq_lc_map[lc])
                         if len(present) >= 12:
-                            # avoid quadratic explosion per sentence
                             break
+                sentence_considered += 1
                 if len(present) < 2:
                     continue
+                sentence_with_pairs += 1
                 for a, b in itertools.combinations(sorted(present, key=str.lower), 2):
-                    key = (a.lower(), b.lower())
+                    pair_key = frozenset({a.lower(), b.lower()})
+                    if pair_key in pair_seen:
+                        continue
+                    pair_seen.add(pair_key)
+                    heuristics_by_pair[pair_key] = classify_relation_heuristic(a, b, sentence)
+                    candidates.append({
+                        "entity_a": a,
+                        "entity_b": b,
+                        "sentence": sentence,
+                    })
+                    if max_cooc_pairs and len(candidates) >= max_cooc_pairs:
+                        break
+                if max_cooc_pairs and len(candidates) >= max_cooc_pairs:
+                    break
+
+            if max_cooc_pairs and max_cooc_pairs <= len(triples):
+                candidates = []
+
+            if debug_cooccurrence:
+                print(
+                    "  Co-occurrence fallback: sentences considered="
+                    f"{sentence_considered}, with_pairs={sentence_with_pairs}, candidates={len(candidates)}, existing_triples={len(triples)}"
+                )
+
+            added_pairs: Set[Tuple[str, str]] = set()
+            llm_pairs: Set[frozenset[str]] = set()
+            llm_added = 0
+            heur_added = 0
+            remaining_budget = max_cooc_pairs - len(triples) if max_cooc_pairs else None
+            max_pairs = remaining_budget if remaining_budget is not None else len(candidates)
+
+            if candidates and (remaining_budget is None or remaining_budget > 0):
+                if debug_cooccurrence:
+                    print(
+                        f"  Co-occurrence fallback: invoking LLM with up to {max_pairs if max_pairs else len(candidates)} pair(s)"
+                    )
+                llm_relations = infer_relations_with_llm(
+                    candidates,
+                    doc_label=filename or doc_key,
+                    max_pairs=max_pairs,
+                    temperature=0.0,
+                    debug=debug_cooccurrence,
+                )
+                for subj, pred, obj in llm_relations:
+                    key = (subj.lower(), obj.lower())
                     if key in added_pairs:
                         continue
-                    triples.append((a, "co_occurs", b))
+                    pair_key = frozenset({subj.lower(), obj.lower()})
+                    llm_pairs.add(pair_key)
+                    triples.append((subj, pred, obj))
                     added_pairs.add(key)
-                    total_added += 1
-                    if total_added >= max_cooc_pairs:
+                    llm_added += 1
+                    if remaining_budget is not None and len(triples) >= max_cooc_pairs:
                         break
-            if total_added:
-                print(f"  Co-occurrence fallback added {total_added} relation(s)")
+
+            if candidates and (remaining_budget is None or len(triples) < max_cooc_pairs):
+                if debug_cooccurrence and not llm_added:
+                    print("  Co-occurrence fallback: falling back to heuristic relations")
+                for pair_key, heur in heuristics_by_pair.items():
+                    if pair_key in llm_pairs:
+                        continue
+                    subj, pred, obj = heur
+                    key = (subj.lower(), obj.lower())
+                    if key in added_pairs:
+                        continue
+                    triples.append((subj, pred, obj))
+                    added_pairs.add(key)
+                    heur_added += 1
+                    if remaining_budget is not None and len(triples) >= max_cooc_pairs:
+                        break
+
+            if llm_added:
+                print(f"  LLM co-occurrence fallback added {llm_added} relation(s)")
+            elif heur_added:
+                print(f"  Heuristic co-occurrence fallback added {heur_added} relation(s)")
+            elif debug_cooccurrence and not candidates:
+                print("  Co-occurrence fallback: no candidate pairs available")
 
         # Persist edges
         for (s, p, o) in triples:
@@ -588,6 +1067,11 @@ def process_documents(
             )
 
         # Mark source doc as processed if we extracted anything
+        if debug:
+            print(
+                f"  Normalized entities={len(uniq_entities)} relations={len(triples)} before persistence"
+            )
+
         if uniq_entities or triples:
             try:
                 coll.update({"_key": doc_key, "kg_processed_ts": db.time(), "kg_entities_count": len(key_by_label), "kg_relations_count": len(triples)})
@@ -597,7 +1081,10 @@ def process_documents(
         processed += 1
         print(f"  Done: {filename} -> entities={len(key_by_label)} relations={len(triples)}")
 
-    print(f"All done. Processed {processed} document(s).")
+    print(
+        f"All done. Processed {processed} document(s). "
+        f"Graph '{graph_name}' with collections '{vertex_col}'/'{edge_col}' is ready."
+    )
 
 
 # -----------------------------
@@ -607,7 +1094,7 @@ def process_documents(
 def parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
-    p = argparse.ArgumentParser(description="Build a knowledge graph in ArangoDB from Markdown documents via KGGen.")
+    p = argparse.ArgumentParser(description="Build a knowledge graph in ArangoDB from Markdown documents using local LLM extraction.")
     p.add_argument("--source", dest="source_collection", default=get_env("ARANGO_DOCS_COLLECTION", "documents"),
                    help="ArangoDB collection holding documents with md_text (default: documents)")
     p.add_argument("--graph", dest="graph_name", default=get_env("ARANGO_GRAPH_NAME", "knowledge_graph"),
@@ -616,10 +1103,12 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
                    help="Vertex collection name")
     p.add_argument("--ecol", dest="edge_col", default=get_env("ARANGO_EDGE_COLLECTION", "kg_edges"),
                    help="Edge collection name")
+    p.add_argument("--reuse-graph", action="store_true", help="Skip resetting the graph/collections before processing")
+    p.add_argument("--debug", action="store_true", help="Enable verbose debug logging for processing flow")
     p.add_argument("--only-unprocessed", action="store_true", help="Only process docs missing kg_processed_ts")
     p.add_argument("--limit", type=int, default=None, help="Max number of documents to process")
     p.add_argument("--max-chars", type=int, default=None, help="Truncate md_text to this many characters")
-    p.add_argument("--model", type=str, default=None, help="KGGen model override (else env KGGEN_MODEL)")
+    p.add_argument("--model", type=str, default=None, help="Primary Ollama model to use (else env KGGEN_MODEL or autodetect)")
     p.add_argument("--chunk-size", type=int, default=6000, help="Split long docs into chunks of up to this many characters")
     p.add_argument("--retries", type=int, default=1, help="Number of additional retries per chunk with fallback models")
     p.add_argument(
@@ -630,6 +1119,9 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
     )
     p.add_argument("--no-cooc", action="store_true", help="Disable co-occurrence fallback when relations are empty")
     p.add_argument("--max-cooc-pairs", type=int, default=300, help="Cap on co-occurrence edges added per document")
+    p.add_argument("--debug-cooc", action="store_true", help="Enable verbose co-occurrence fallback logging")
+    p.add_argument("--no-cluster", action="store_true", help="Disable KGGen-based clustering before persistence")
+    p.add_argument("--cluster-model", type=str, default=os.getenv("KG_CLUSTER_MODEL", ""), help="Override model used for clustering (defaults to KG_CLUSTER_MODEL or primary model)")
 
     args = p.parse_args(argv)
     return vars(args)
@@ -639,6 +1131,14 @@ if __name__ == "__main__":
     kwargs = parse_args(sys.argv[1:])
     if kwargs.pop("no_cooc", False):
         kwargs["fallback_cooccurrence"] = False
+    kwargs["debug"] = kwargs.pop("debug", False)
+    kwargs["debug_cooccurrence"] = kwargs.pop("debug_cooc", False)
+    if kwargs.pop("no_cluster", False):
+        kwargs["cluster_graph_enabled"] = False
+    # Normalize optional cluster model string
+    cluster_model_value = kwargs.get("cluster_model")
+    if isinstance(cluster_model_value, str) and not cluster_model_value.strip():
+        kwargs["cluster_model"] = None
     if "max_cooc_pairs" in kwargs:
         # already present via parse_args
         pass
