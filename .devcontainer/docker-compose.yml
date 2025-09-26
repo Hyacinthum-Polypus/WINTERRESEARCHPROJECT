@@ -6,6 +6,11 @@ services:
     volumes:
       - ..:/workspaces/winterresearchproject:cached
     command: sleep infinity
+    environment:
+      - ARANGO_URL=http://arangodb:8529
+      - ARANGO_ROOT_PASSWORD=password
+    depends_on:
+      - arangodb
 
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
@@ -34,5 +39,18 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  arangodb:
+    image: arangodb:3.11
+    environment:
+      - ARANGO_ROOT_PASSWORD=password
+      - ARANGO_STORAGE_ENGINE=rocksdb
+    ports:
+      - "8529:8529"
+    volumes:
+      - arangodb_data:/var/lib/arangodb3
+      - arangodb_apps_data:/var/lib/arangodb3-apps
+
 volumes:
   postgres_data:
+  arangodb_data:
+  arangodb_apps_data:
