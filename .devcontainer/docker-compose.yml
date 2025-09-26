@@ -1,0 +1,38 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspaces/winterresearchproject:cached
+    command: sleep infinity
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    ports:
+      - "4000:4000"
+    environment: 
+      - LITELLM_MASTER_KEY="sk-1234"
+      - UI_USERNAME=admin
+      - UI_PASSWORD=password
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/litellm_db
+      - STORE_MODEL_IN_DB=true
+      # Point LiteLLM to your Ollama server. If Ollama runs on the host, use host.docker.internal
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    command: --host 0.0.0.0 --port 4000
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:latest
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=litellm_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
