@@ -5,7 +5,10 @@
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"dockerComposeFile": "docker-compose.yml",
 	"service": "app",
-	"workspaceFolder": "/workspaces/winterresearchproject"
+	"workspaceFolder": "/workspaces/winterresearchproject",
+
+	// Ensure dependencies are installed on container create (useful when editing requirements)
+	"postCreateCommand": "python3 -m pip install --no-cache-dir -r requirements.txt"
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},

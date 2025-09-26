@@ -5,5 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps via pip (not apt)
-RUN pip install --no-cache-dir pymupdf python-arango pymupdf4llm pathlib python-dotenv kg-gen
+# Install Python deps via pinned requirements for reproducible builds
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --no-cache-dir -r /tmp/requirements.txt
