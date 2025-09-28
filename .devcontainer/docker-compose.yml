@@ -26,6 +26,7 @@ services:
       - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-https://example.com}
       - OPENROUTER_APP_NAME=${OPENROUTER_APP_NAME:-Research KG Builder}
       - OPENROUTER_TIMEOUT=${OPENROUTER_TIMEOUT:-120}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
     command: --host 0.0.0.0 --port 4000 --config /app/config.yaml

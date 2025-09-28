@@ -3,12 +3,10 @@ from kg_gen import KGGen
 from dotenv import load_dotenv
 load_dotenv()
 
-# Configure OpenAI-compatible base URL for LiteLLM so KGGen routes via LiteLLM.
-# Default to the docker-compose service name when running inside the devcontainer.
-# Prefer explicit base URL from env; default to host's LiteLLM port (works from devcontainer)
-_base_url = os.getenv("LITELLM_BASE_URL", "http://host.docker.internal:4000")
-os.environ.setdefault("OPENAI_API_BASE", _base_url)
-os.environ.setdefault("OPENAI_BASE_URL", _base_url)
+# Configure LiteLLM base URL so KGGen routes through the proxy by default.
+# Prefer explicit base URL from env; default to host's LiteLLM port (works from devcontainer).
+_base_url = os.getenv("LITELLM_BASE_URL") or "http://host.docker.internal:4000"
+os.environ.setdefault("LITELLM_BASE_URL", _base_url)
 
 # Ensure OPENAI_API_KEY is set for OpenAI-compatible clients
 _api_key = os.getenv("LITELLM_API_KEY")

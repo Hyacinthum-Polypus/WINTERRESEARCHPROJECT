@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import itertools
 from typing import Iterable, Optional, Tuple, Dict, Any, List, Set
+from urllib.parse import urlsplit
 
 from arango import ArangoClient
 from arango.graph import Graph
@@ -29,6 +30,117 @@ except ImportError:
 logging.getLogger("dspy.adapters.json_adapter").setLevel(logging.ERROR)
 
 load_dotenv()
+
+_SERVICE_HEALTH_CACHE: Dict[str, bool] = {}
+_SERVICE_WARNING_SENT: Set[str] = set()
+
+
+def _is_service_available(base_url: Optional[str], *, timeout: float = 2.0) -> bool:
+    if not base_url:
+        return False
+    parsed = urlsplit(base_url)
+    if not parsed.scheme:
+        return False
+    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+    cached = _SERVICE_HEALTH_CACHE.get(normalized)
+    if cached is not None:
+        return cached
+    for method in (requests.head, requests.get):
+        try:
+            method(normalized or base_url, timeout=timeout, allow_redirects=True)
+            _SERVICE_HEALTH_CACHE[normalized] = True
+            return True
+        except Exception:
+            continue
+    _SERVICE_HEALTH_CACHE[normalized] = False
+    return False
+
+
+def _infer_model_provider(model: str) -> str:
+    name = (model or "").lower()
+    if name.startswith(("openai/", "gpt-", "o1-", "o3-", "text-", "chatgpt-")):
+        return "openai"
+    if name.startswith(("azure/", "azure-openai/")):
+        return "openai"
+    if name.startswith(("ollama/", "ollama_chat/")):
+        return "ollama"
+    return "openrouter"
+
+
+def _resolve_llm_client_settings(model: str) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]]]:
+    base_override = os.getenv("LITELLM_BASE_URL")
+    if base_override and _is_service_available(base_override):
+        headers_env = os.getenv("LITELLM_HEADERS")
+        extra_headers: Optional[Dict[str, str]] = None
+        if headers_env:
+            try:
+                parsed = json.loads(headers_env)
+                if isinstance(parsed, dict):
+                    extra_headers = parsed
+            except Exception:
+                extra_headers = None
+        api_key = (
+            os.getenv("LITELLM_MASTER_KEY")
+            or os.getenv("LITELLM_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
+        return base_override, api_key, extra_headers
+
+    if base_override and base_override not in _SERVICE_WARNING_SENT:
+        logging.warning(
+            "Configured LITELLM_BASE_URL '%s' is unreachable; using direct provider endpoints.",
+            base_override,
+        )
+        _SERVICE_WARNING_SENT.add(base_override)
+
+    provider = _infer_model_provider(model)
+
+    if provider == "openai":
+        base = os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1"
+        return base, os.getenv("OPENAI_API_KEY"), None
+
+    if provider == "ollama":
+        base = os.getenv("OLLAMA_BASE_URL") or "http://host.docker.internal:11434"
+        key = os.getenv("LITELLM_MASTER_KEY") or os.getenv("LITELLM_API_KEY")
+        return base, key, None
+
+    headers_env = os.getenv("LITELLM_HEADERS")
+    extra_headers: Optional[Dict[str, str]] = None
+    if headers_env:
+        try:
+            parsed = json.loads(headers_env)
+            if isinstance(parsed, dict):
+                extra_headers = parsed
+        except Exception:
+            extra_headers = None
+    base = os.getenv("OPENROUTER_API_BASE") or "https://openrouter.ai/api/v1"
+    key = (
+        os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("LITELLM_MASTER_KEY")
+        or os.getenv("LITELLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    return base, key, extra_headers
+
+
+# -----------------------------
+# LLM parameter helpers
+# -----------------------------
+
+def _normalize_temperature(model: str, temperature: Optional[float]) -> Optional[float]:
+    if temperature is None:
+        return None
+    name = (model or "").lower()
+    if "gpt-5-nano" in name:
+        if temperature not in (None, 1, 1.0):
+            logging.info(
+                "Model '%s' only supports default temperature; overriding %.2f -> 1.0",
+                model,
+                temperature,
+            )
+        return 1.0
+    return temperature
 
 
 # -----------------------------
@@ -193,19 +305,15 @@ def ensure_graph(db, cols: GraphCollections, *, fresh: bool = True, debug: bool 
 # -----------------------------
 
 def configure_llm_env() -> None:
-    # Configure LiteLLM to route requests through OpenRouter by default.
-    _base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-    # Explicitly set the OpenRouter base URL so downstream helpers can find it
-    os.environ.setdefault("OPENROUTER_BASE_URL", _base_url)
+    # Configure LiteLLM base URL once so every downstream helper stays aligned.
+    _base_url = os.getenv("LITELLM_BASE_URL") or "http://host.docker.internal:4000"
     os.environ.setdefault("LITELLM_BASE_URL", _base_url)
-    os.environ.setdefault("OPENAI_API_BASE", _base_url)
-    os.environ.setdefault("OPENAI_BASE_URL", _base_url)
 
-    # API key priority: explicit OpenRouter key, then LiteLLM keys, then OpenAI-compatible fallback.
+    # API key priority: LiteLLM keys first, then any OpenRouter/OpenAI-compatible fallback.
     _api_key = (
-        os.getenv("OPENROUTER_API_KEY")
-        or os.getenv("LITELLM_API_KEY")
+        os.getenv("LITELLM_API_KEY")
         or os.getenv("LITELLM_MASTER_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
         or os.getenv("OPENAI_API_KEY")
     )
     if _api_key:
@@ -244,14 +352,12 @@ def resolve_primary_model(model: Optional[str] = None) -> str:
 
 def make_clusterer(model: str, temperature: float = 0.0) -> KGGen:
     configure_llm_env()
+    api_base, api_key, _ = _resolve_llm_client_settings(model)
+    temp = _normalize_temperature(model, temperature)
     cluster = KGGen(
         model=model,
-        temperature=temperature,
-        api_base=os.getenv("OPENROUTER_BASE_URL") or os.getenv("LITELLM_BASE_URL") or "",
-        api_key=os.getenv("OPENROUTER_API_KEY")
-        or os.getenv("LITELLM_MASTER_KEY")
-        or os.getenv("LITELLM_API_KEY")
-        or os.getenv("OPENAI_API_KEY"),
+        api_base=api_base or "",
+        api_key=api_key,
     )
     try:
         cluster.dspy.settings.configure(adapter=cluster.dspy.ChatAdapter())
@@ -268,31 +374,9 @@ def _call_openrouter(
     temperature: float,
     timeout: int,
 ) -> str:
-    # Always prefer direct OpenRouter base if targeting an openrouter/* model
-    if model.startswith("openrouter/"):
-        api_base = os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
-    else:
-        api_base = (
-            os.getenv("OPENROUTER_BASE_URL")
-            or os.getenv("LITELLM_BASE_URL")
-            or os.getenv("OPENAI_API_BASE")
-            or "https://openrouter.ai/api/v1"
-        )
-    api_key = (
-        os.getenv("OPENROUTER_API_KEY")
-        or os.getenv("LITELLM_MASTER_KEY")
-        or os.getenv("LITELLM_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
-    headers_env = os.getenv("LITELLM_HEADERS")
-    extra_headers: Optional[Dict[str, str]] = None
-    if headers_env:
-        try:
-            parsed = json.loads(headers_env)
-            if isinstance(parsed, dict):
-                extra_headers = parsed
-        except Exception:
-            extra_headers = None
+    api_base, api_key, extra_headers = _resolve_llm_client_settings(model)
+
+    sanitized_temp = _normalize_temperature(model, temperature)
 
     response = litellm_completion(
         model=model,
@@ -300,7 +384,6 @@ def _call_openrouter(
         timeout=timeout,
         api_base=api_base,
         api_key=api_key,
-        temperature=temperature,
         extra_headers=extra_headers,
     )
     try:
@@ -366,7 +449,6 @@ def extract_kg_with_model(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=temperature,
         timeout=timeout,
     )
     if debug:
@@ -419,7 +501,6 @@ def try_generate_kg(
                 model=model,
                 input_text=input_text,
                 context=context,
-                temperature=temperature,
                 debug=debug,
                 timeout=timeout,
             )
@@ -797,18 +878,24 @@ def process_documents(
     if debug:
         print(f"Model order: {', '.join(models_to_try)}")
 
-    clusterer = None
-    clusterer_model = None
-    if cluster_graph_enabled and models_to_try:
-        clusterer_model = cluster_model or os.getenv("KG_CLUSTER_MODEL") or models_to_try[0]
+    kg_client = None
+    clusterer_model = cluster_model or os.getenv("KG_CLUSTER_MODEL")
+    if not clusterer_model and models_to_try:
+        clusterer_model = models_to_try[0]
+    if clusterer_model:
         try:
-            clusterer = make_clusterer(clusterer_model)
+            kg_client = make_clusterer(clusterer_model)
             if debug:
-                print(f"  Clustering enabled via KGGen model '{clusterer_model}'")
+                print(f"  KGGen client initialized with model '{clusterer_model}'")
         except Exception as exc:
-            clusterer = None
+            kg_client = None
             if debug:
-                print(f"  Clustering disabled: unable to initialize KGGen ({exc})")
+                print(f"  KGGen unavailable (model='{clusterer_model}'): {exc}")
+    else:
+        if debug:
+            print("  No KGGen model resolved; aggregation will fall back to manual union")
+
+    doc_graphs: List[KGGraph] = []
 
     processed = 0
     for doc in cursor:
@@ -833,7 +920,6 @@ def process_documents(
             md_text,
             filename,
             models_to_try,
-            temperature=0.0,
             debug=debug,
             timeout=llm_timeout,
         )
@@ -858,7 +944,6 @@ def process_documents(
                     ch,
                     f"{filename} (part {idx}/{len(chunks)})",
                     models_to_try,
-                    temperature=0.0,
                     debug=debug,
                     timeout=llm_timeout,
                 )
@@ -899,28 +984,6 @@ def process_documents(
                 f"  LLM output summary: raw_entities={len(normalized_entities)} raw_relations={len(normalized_relations)}"
             )
 
-        if cluster_graph_enabled and clusterer and (normalized_entities or normalized_relations):
-            try:
-                kg_input = KGGraph(
-                    entities=set(normalized_entities),
-                    edges={rel[1] for rel in normalized_relations},
-                    relations=set(normalized_relations),
-                )
-                clustered = clusterer.cluster(kg_input, context=filename)
-                if debug:
-                    print(
-                        "  Clustered entities {:d}→{:d}, relations {:d}→{:d}".format(
-                            len(normalized_entities),
-                            len(clustered.entities),
-                            len(normalized_relations),
-                            len(clustered.relations),
-                        )
-                    )
-                normalized_entities = list(clustered.entities)
-                normalized_relations = list(clustered.relations)
-            except Exception as exc:
-                if debug:
-                    print(f"  Clustering failed: {exc}")
         # Unique-ify while preserving case (dedupe by lowercase)
         seen_lc = set()
         uniq_entities: List[str] = []
@@ -930,9 +993,6 @@ def process_documents(
                 continue
             seen_lc.add(lc)
             uniq_entities.append(label)
-
-        # Persist vertices
-        key_by_label = upsert_entities(db, vertex_col, uniq_entities)
 
         # Collect relations (triples)
         triples: List[Tuple[str, str, str]] = list(normalized_relations)
@@ -1009,7 +1069,6 @@ def process_documents(
                     candidates,
                     doc_label=filename or doc_key,
                     max_pairs=max_pairs,
-                    temperature=0.0,
                     debug=debug_cooccurrence,
                 )
                 for subj, pred, obj in llm_relations:
@@ -1047,19 +1106,13 @@ def process_documents(
             elif debug_cooccurrence and not candidates:
                 print("  Co-occurrence fallback: no candidate pairs available")
 
-        # Persist edges
-        for (s, p, o) in triples:
-            skey = key_by_label.get(s) or stable_key("e", s.lower())
-            okey = key_by_label.get(o) or stable_key("e", o.lower())
-            upsert_edge(
-                db,
-                edge_col=edge_col,
-                vertex_col=vertex_col,
-                from_key=skey,
-                to_key=okey,
-                relation=p,
-                doc_key=doc_key,
-                extra={"source_filename": filename},
+        if uniq_entities or triples:
+            doc_graphs.append(
+                KGGraph(
+                    entities=set(uniq_entities),
+                    edges={rel[1] for rel in triples},
+                    relations=set(triples),
+                )
             )
 
         # Mark source doc as processed if we extracted anything
@@ -1070,16 +1123,84 @@ def process_documents(
 
         if uniq_entities or triples:
             try:
-                coll.update({"_key": doc_key, "kg_processed_ts": db.time(), "kg_entities_count": len(key_by_label), "kg_relations_count": len(triples)})
+                coll.update({
+                    "_key": doc_key,
+                    "kg_processed_ts": db.time(),
+                    "kg_entities_count": len(uniq_entities),
+                    "kg_relations_count": len(triples),
+                })
             except Exception:
                 pass
 
         processed += 1
-        print(f"  Done: {filename} -> entities={len(key_by_label)} relations={len(triples)}")
+        print(f"  Done: {filename} -> entities={len(uniq_entities)} relations={len(triples)}")
+
+    if not doc_graphs:
+        print("No knowledge graph content extracted; skipping aggregation and persistence.")
+        return
+
+    if kg_client:
+        combined_graph = kg_client.aggregate(doc_graphs)
+    else:
+        combined_entities: Set[str] = set()
+        combined_relations: Set[Tuple[str, str, str]] = set()
+        for g in doc_graphs:
+            combined_entities.update(g.entities)
+            combined_relations.update(g.relations)
+        combined_graph = KGGraph(
+            entities=combined_entities,
+            edges={rel[1] for rel in combined_relations},
+            relations=combined_relations,
+        )
+
+    if debug:
+        print(
+            f"Aggregated graph from {len(doc_graphs)} document graph(s): "
+            f"entities={len(combined_graph.entities)} relations={len(combined_graph.relations)}"
+        )
+
+    if cluster_graph_enabled and kg_client:
+        try:
+            aggregate_context = f"{source_collection} aggregate ({processed} docs)"
+            clustered_graph = kg_client.cluster(combined_graph, context=aggregate_context)
+            final_graph = clustered_graph
+            if debug:
+                print(
+                    "Clustered aggregated graph: entities {:d}→{:d}, relations {:d}→{:d}".format(
+                        len(combined_graph.entities),
+                        len(clustered_graph.entities),
+                        len(combined_graph.relations),
+                        len(clustered_graph.relations),
+                    )
+                )
+        except Exception as exc:
+            final_graph = combined_graph
+            if debug:
+                print(f"Aggregated clustering failed: {exc}")
+    else:
+        final_graph = combined_graph
+
+    final_entities = sorted(final_graph.entities)
+    key_by_label = upsert_entities(db, vertex_col, final_entities)
+
+    final_relations = list(final_graph.relations)
+    for subj, pred, obj in final_relations:
+        skey = key_by_label.get(subj) or stable_key("e", subj.lower())
+        okey = key_by_label.get(obj) or stable_key("e", obj.lower())
+        upsert_edge(
+            db,
+            edge_col=edge_col,
+            vertex_col=vertex_col,
+            from_key=skey,
+            to_key=okey,
+            relation=pred,
+            doc_key="aggregate",
+            extra={"source_filename": "aggregate"},
+        )
 
     print(
         f"All done. Processed {processed} document(s). "
-        f"Graph '{graph_name}' with collections '{vertex_col}'/'{edge_col}' is ready."
+        f"Aggregated graph '{graph_name}' now has entities={len(final_entities)} relations={len(final_relations)}."
     )
 
 
