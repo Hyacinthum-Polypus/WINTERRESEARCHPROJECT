@@ -232,7 +232,10 @@ def resolve_primary_model(model: Optional[str] = None) -> str:
         return env_model
     # Preferred OpenRouter models (instruction-tuned for knowledge extraction).
     candidates = [
-        "openrouter/qwen/qwen3-14b:free",
+        "openrouter/x-ai/grok-4-fast:free",
+        "openrouter/openai/gpt-oss-20b:free",
+        "openrouter/qwen/qwen3-30b-a3b:free",
+        "google/gemma-3-27b-it:free"
     ]
     return candidates[0]
 
@@ -777,9 +780,10 @@ def process_documents(
     else:
         # Sensible defaults on OpenRouter (instruction-tuned)
         fallback_models = [
-            "openrouter/qwen2.5:14b-instruct",
-            "openrouter/mixtral-8x7b-instruct",
-            "openrouter/meta-llama/llama-3.1-8b-instruct",
+            "openrouter/x-ai/grok-4-fast:free",
+            "openrouter/openai/gpt-oss-20b:free",
+            "openrouter/qwen/qwen3-30b-a3b:free",
+            "google/gemma-3-27b-it:free"
         ]
     fallback_models = [m for m in fallback_models if m != primary_model]
     models_to_try: List[str] = []
