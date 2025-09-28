@@ -233,6 +233,8 @@ def resolve_primary_model(model: Optional[str] = None) -> str:
     # Preferred OpenRouter models (instruction-tuned for knowledge extraction).
     candidates = [
         "openrouter/x-ai/grok-4-fast:free",
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
         "openrouter/openai/gpt-oss-20b:free",
         "openrouter/qwen/qwen3-30b-a3b:free",
         "google/gemma-3-27b-it:free"
@@ -781,6 +783,8 @@ def process_documents(
         # Sensible defaults on OpenRouter (instruction-tuned)
         fallback_models = [
             "openrouter/x-ai/grok-4-fast:free",
+            "google/gemini-2.0-flash-exp:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
             "openrouter/openai/gpt-oss-20b:free",
             "openrouter/qwen/qwen3-30b-a3b:free",
             "google/gemma-3-27b-it:free"
