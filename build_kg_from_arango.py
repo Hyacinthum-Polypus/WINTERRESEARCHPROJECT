@@ -129,17 +129,15 @@ def _resolve_llm_client_settings(model: str) -> Tuple[Optional[str], Optional[st
 # -----------------------------
 
 def _normalize_temperature(model: str, temperature: Optional[float]) -> Optional[float]:
-    if temperature is None:
-        return None
     name = (model or "").lower()
-    if "gpt-5-nano" in name:
+    if "gpt-5" in name:
         if temperature not in (None, 1, 1.0):
             logging.info(
-                "Model '%s' only supports default temperature; overriding %.2f -> 1.0",
+                "Model '%s' ignores custom temperature; dropping override %.2f",
                 model,
                 temperature,
             )
-        return 1.0
+        return None
     return temperature
 
 
@@ -354,11 +352,15 @@ def make_clusterer(model: str, temperature: float = 0.0) -> KGGen:
     configure_llm_env()
     api_base, api_key, _ = _resolve_llm_client_settings(model)
     temp = _normalize_temperature(model, temperature)
-    cluster = KGGen(
-        model=model,
-        api_base=api_base or "",
-        api_key=api_key,
-    )
+    cluster_kwargs: Dict[str, Any] = {
+        "model": model,
+        "api_base": api_base or "",
+        "api_key": api_key,
+    }
+    effective_temp = temp if temp is not None else temperature
+    if effective_temp is not None:
+        cluster_kwargs["temperature"] = effective_temp
+    cluster = KGGen(**cluster_kwargs)
     try:
         cluster.dspy.settings.configure(adapter=cluster.dspy.ChatAdapter())
     except Exception:
@@ -377,15 +379,18 @@ def _call_openrouter(
     api_base, api_key, extra_headers = _resolve_llm_client_settings(model)
 
     sanitized_temp = _normalize_temperature(model, temperature)
+    request_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "timeout": timeout,
+        "api_base": api_base,
+        "api_key": api_key,
+        "extra_headers": extra_headers,
+    }
+    if sanitized_temp is not None:
+        request_kwargs["temperature"] = sanitized_temp
 
-    response = litellm_completion(
-        model=model,
-        messages=messages,
-        timeout=timeout,
-        api_base=api_base,
-        api_key=api_key,
-        extra_headers=extra_headers,
-    )
+    response = litellm_completion(**request_kwargs)
     try:
         content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
@@ -449,6 +454,7 @@ def extract_kg_with_model(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        temperature=temperature,
         timeout=timeout,
     )
     if debug:
