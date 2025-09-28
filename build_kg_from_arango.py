@@ -162,6 +162,25 @@ def stable_key(prefix: str, *parts: str, algo: str = "sha1") -> str:
     return f"{prefix}_{h.hexdigest()}"
 
 
+def sanitise_label_to_key(label: str) -> str:
+    """Make a label safe as an Arango _key."""
+    if label is None:
+        return ""
+    # Strip leading/trailing spaces
+    s = str(label).strip()
+    if not s:
+        return ""
+    # Replace whitespace runs with single underscore
+    s = re.sub(r"\s+", "_", s)
+    # Drop characters not allowed
+    s = "".join(ch for ch in s if ch in _ALLOWED)
+    # Edge case: key cannot be empty
+    if not s:
+        return ""
+    # Cap length
+    if len(s) > _MAX_KEY_LEN:
+        s = s[:_MAX_KEY_LEN]
+
 # -----------------------------
 # Arango setup helpers
 # -----------------------------
@@ -172,6 +191,8 @@ class ArangoConfig:
     username: str
     password: str
     db_name: str
+
+
 
 
 def get_arango_config() -> ArangoConfig:
@@ -731,7 +752,7 @@ def upsert_entities(db, vertex_col: str, labels: Iterable[str]) -> Dict[str, str
     for label in labels:
         if not label:
             continue
-        key = stable_key("e", label.lower())
+        key = sanitise_label_to_key(label)
         # Store human-readable value alongside Arango _key for display
         doc = {"_key": key, "label": label}
         try:
