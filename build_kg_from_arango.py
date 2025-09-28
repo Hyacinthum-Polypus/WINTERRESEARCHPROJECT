@@ -12,7 +12,10 @@ from arango.graph import Graph
 from dotenv import load_dotenv
 
 import json
+import logging
 import requests
+
+from litellm import completion as litellm_completion
 
 from kg_gen import KGGen
 from kg_gen.models import Graph as KGGraph
@@ -21,6 +24,9 @@ try:
     from json_repair import repair_json
 except ImportError:
     repair_json = None
+
+# Quiet DSPy JSON adapter warnings when we fall back to legacy adapters.
+logging.getLogger("dspy.adapters.json_adapter").setLevel(logging.ERROR)
 
 load_dotenv()
 
@@ -187,32 +193,34 @@ def ensure_graph(db, cols: GraphCollections, *, fresh: bool = True, debug: bool 
 # -----------------------------
 
 def configure_llm_env() -> None:
-    # Configure OpenAI-compatible base URL for LiteLLM so downstream LLM calls route consistently.
-    _base_url = os.getenv("LITELLM_BASE_URL", "http://host.docker.internal:4000")
+    # Configure LiteLLM to route requests through OpenRouter by default.
+    _base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    # Explicitly set the OpenRouter base URL so downstream helpers can find it
+    os.environ.setdefault("OPENROUTER_BASE_URL", _base_url)
+    os.environ.setdefault("LITELLM_BASE_URL", _base_url)
     os.environ.setdefault("OPENAI_API_BASE", _base_url)
     os.environ.setdefault("OPENAI_BASE_URL", _base_url)
 
-    # API key for OpenAI-compatible clients (LiteLLM)
-    _api_key = os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY")
+    # API key priority: explicit OpenRouter key, then LiteLLM keys, then OpenAI-compatible fallback.
+    _api_key = (
+        os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("LITELLM_API_KEY")
+        or os.getenv("LITELLM_MASTER_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
     if _api_key:
         os.environ.setdefault("OPENAI_API_KEY", _api_key)
 
-    # Allow LiteLLM to locate Ollama if needed
-    _ollama_base = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-    os.environ.setdefault("OLLAMA_BASE_URL", _ollama_base)
-
-
-def get_available_ollama_models() -> List[str]:
-    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    url = f"{base}/api/tags"
-    try:
-        r = requests.get(url, timeout=3)
-        r.raise_for_status()
-        data = r.json()
-        names = [m.get("name") or m.get("model") for m in data.get("models", [])]
-        return [n for n in names if isinstance(n, str)]
-    except Exception:
-        return []
+    # Optional OpenRouter headers (helps comply with usage policy).
+    site_url = os.getenv("OPENROUTER_SITE_URL")
+    app_name = os.getenv("OPENROUTER_APP_NAME")
+    headers = {}
+    if site_url:
+        headers["HTTP-Referer"] = site_url
+    if app_name:
+        headers["X-Title"] = app_name
+    if headers:
+        os.environ.setdefault("LITELLM_HEADERS", json.dumps(headers))
 
 
 def resolve_primary_model(model: Optional[str] = None) -> str:
@@ -222,19 +230,11 @@ def resolve_primary_model(model: Optional[str] = None) -> str:
     env_model = os.getenv("KGGEN_MODEL")
     if env_model:
         return env_model
-    avail = set(get_available_ollama_models())
+    # Preferred OpenRouter models (instruction-tuned for knowledge extraction).
     candidates = [
-        "ollama_chat/qwen2.5:14b-instruct",
-        "ollama_chat/qwen2.5:7b-instruct",
-        "ollama_chat/llama3.1:8b",
-        "ollama_chat/gpt-oss:20b",
-        "ollama_chat/llama3.2:3b",
+        "openrouter/qwen/qwen3-14b:free",
     ]
-    def is_present(c: str) -> bool:
-        tag = c.split("/", 1)[1] if "/" in c else c
-        return tag in avail
-    chosen = next((c for c in candidates if is_present(c)), None)
-    return chosen or "ollama_chat/llama3.2:3b"
+    return candidates[0]
 
 
 def make_clusterer(model: str, temperature: float = 0.0) -> KGGen:
@@ -242,89 +242,69 @@ def make_clusterer(model: str, temperature: float = 0.0) -> KGGen:
     cluster = KGGen(
         model=model,
         temperature=temperature,
-        api_base=os.getenv("OLLAMA_BASE_URL", ""),
-        api_key=os.getenv("LITELLM_MASTER_KEY") or os.getenv("LITELLM_API_KEY"),
+        api_base=os.getenv("OPENROUTER_BASE_URL") or os.getenv("LITELLM_BASE_URL") or "",
+        api_key=os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("LITELLM_MASTER_KEY")
+        or os.getenv("LITELLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY"),
     )
     try:
         cluster.dspy.settings.configure(adapter=cluster.dspy.ChatAdapter())
     except Exception:
         pass
+    cluster.config_json_adapter = True
     return cluster
 
 
-def _ollama_generate(
+def _call_openrouter(
     *,
-    base_url: str,
     model: str,
     messages: List[Dict[str, str]],
     temperature: float,
     timeout: int,
 ) -> str:
-    # Flatten messages into a single prompt for the legacy generate endpoint.
-    convo = []
-    for msg in messages:
-        role = msg.get("role", "user").strip().upper()
-        convo.append(f"{role}: {msg.get('content', '')}")
-    convo.append("ASSISTANT:")
-    prompt = "\n".join(convo)
-    url = f"{base_url}/api/generate"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-        },
-    }
-    resp = requests.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data.get("response")
-    if not isinstance(content, str):
-        raise ValueError("Ollama generate response missing 'response' text")
-    return content
+    # Always prefer direct OpenRouter base if targeting an openrouter/* model
+    if model.startswith("openrouter/"):
+        api_base = os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+    else:
+        api_base = (
+            os.getenv("OPENROUTER_BASE_URL")
+            or os.getenv("LITELLM_BASE_URL")
+            or os.getenv("OPENAI_API_BASE")
+            or "https://openrouter.ai/api/v1"
+        )
+    api_key = (
+        os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("LITELLM_MASTER_KEY")
+        or os.getenv("LITELLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    headers_env = os.getenv("LITELLM_HEADERS")
+    extra_headers: Optional[Dict[str, str]] = None
+    if headers_env:
+        try:
+            parsed = json.loads(headers_env)
+            if isinstance(parsed, dict):
+                extra_headers = parsed
+        except Exception:
+            extra_headers = None
 
-
-def _ollama_chat(
-    *,
-    model: str,
-    messages: List[Dict[str, str]],
-    temperature: float = 0.0,
-    timeout: int = 120,
-) -> str:
-    # Allow callers to pass provider-prefixed names (e.g. "ollama_chat/qwen") while Ollama expects bare model id.
-    model_id = model.split("/", 1)[1] if "/" in model else model
-    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    chat_url = f"{base}/api/chat"
-    payload = {
-        "model": model_id,
-        "messages": messages,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-        },
-    }
+    response = litellm_completion(
+        model=model,
+        messages=messages,
+        timeout=timeout,
+        api_base=api_base,
+        api_key=api_key,
+        temperature=temperature,
+        extra_headers=extra_headers,
+    )
     try:
-        resp = requests.post(chat_url, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        message = data.get("message", {})
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise ValueError("Ollama chat response missing assistant content")
-        return content
-    except requests.HTTPError as http_err:
-        status = http_err.response.status_code if http_err.response is not None else None
-        if status == 404:
-            # Older Ollama versions expose only /api/generate; fall back to that path.
-            return _ollama_generate(
-                base_url=base,
-                model=model_id,
-                messages=messages,
-                temperature=temperature,
-                timeout=timeout,
-            )
-        raise
+        content = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("OpenRouter response missing message content")
+    if not isinstance(content, str):
+        raise ValueError("OpenRouter response content not a string")
+    return content
 
 
 def _parse_kg_json(raw: str) -> Dict[str, Any]:
@@ -361,6 +341,7 @@ def extract_kg_with_model(
     context: str,
     temperature: float = 0.0,
     debug: bool = False,
+    timeout: int = 120,
 ) -> Dict[str, Any]:
     system_prompt = (
         "You build concise knowledge graphs. "
@@ -374,13 +355,14 @@ def extract_kg_with_model(
         "Text:\n"
         f"""{input_text}"""
     )
-    content = _ollama_chat(
+    content = _call_openrouter(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         temperature=temperature,
+        timeout=timeout,
     )
     if debug:
         snippet = content[:200]
@@ -422,6 +404,7 @@ def try_generate_kg(
     *,
     temperature: float = 0.0,
     debug: bool = False,
+    timeout: int = 120,
 ) -> Optional[Dict[str, Any]]:
     for model in models:
         try:
@@ -433,6 +416,7 @@ def try_generate_kg(
                 context=context,
                 temperature=temperature,
                 debug=debug,
+                timeout=timeout,
             )
             if result.get("entities") or result.get("relations"):
                 return result
@@ -724,9 +708,16 @@ def process_documents(
     debug_cooccurrence: bool = False,
     cluster_graph_enabled: bool = True,
     cluster_model: Optional[str] = None,
+    llm_timeout: Optional[int] = None,
 ) -> None:
     cfg = get_arango_config()
     db = get_db(cfg)
+
+    if llm_timeout is None:
+        try:
+            llm_timeout = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+        except ValueError:
+            llm_timeout = 120
 
     # When not reusing, create fresh collection/graph names per run.
     if not reuse_graph:
@@ -756,6 +747,7 @@ def process_documents(
         print(
             f"  Active graph setup: graph='{graph_name}', vertices='{vertex_col}', edges='{edge_col}'"
         )
+        print(f"  LLM timeout per request: {llm_timeout}s")
 
     if not db.has_collection(source_collection):
         print(f"ERROR: Source collection '{source_collection}' not found in DB '{cfg.db_name}'.")
@@ -783,19 +775,13 @@ def process_documents(
     if retry_models:
         fallback_models = [m.strip() for m in retry_models.split(",") if m.strip()]
     else:
-        # Sensible local defaults which tend to be JSON-friendly when prompted
+        # Sensible defaults on OpenRouter (instruction-tuned)
         fallback_models = [
-            "ollama_chat/qwen2.5:14b-instruct",
-            "ollama_chat/llama3.1:8b",
-            "ollama_chat/gpt-oss:20b",
-            "ollama_chat/qwen2.5:7b-instruct",
+            "openrouter/qwen2.5:14b-instruct",
+            "openrouter/mixtral-8x7b-instruct",
+            "openrouter/meta-llama/llama-3.1-8b-instruct",
         ]
-    # Filter to models actually available locally
-    avail = set(get_available_ollama_models())
-    def present(m: str) -> bool:
-        tag = m.split("/", 1)[1] if "/" in m else m
-        return tag in avail
-    fallback_models = [m for m in fallback_models if present(m) and m != primary_model]
+    fallback_models = [m for m in fallback_models if m != primary_model]
     models_to_try: List[str] = []
     for candidate in [primary_model] + fallback_models:
         if candidate and candidate not in models_to_try:
@@ -841,6 +827,7 @@ def process_documents(
             models_to_try,
             temperature=0.0,
             debug=debug,
+            timeout=llm_timeout,
         )
         attempts += 1
         if kg_graph is None and chunk_size and len(md_text) > chunk_size:
@@ -865,6 +852,7 @@ def process_documents(
                     models_to_try,
                     temperature=0.0,
                     debug=debug,
+                    timeout=llm_timeout,
                 )
                 attempts += 1
                 if sub is None:
@@ -1108,7 +1096,7 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
     p.add_argument("--only-unprocessed", action="store_true", help="Only process docs missing kg_processed_ts")
     p.add_argument("--limit", type=int, default=None, help="Max number of documents to process")
     p.add_argument("--max-chars", type=int, default=None, help="Truncate md_text to this many characters")
-    p.add_argument("--model", type=str, default=None, help="Primary Ollama model to use (else env KGGEN_MODEL or autodetect)")
+    p.add_argument("--model", type=str, default=None, help="Primary OpenRouter model (else KGGEN_MODEL or default openrouter/qwen2.5:14b-instruct)")
     p.add_argument("--chunk-size", type=int, default=6000, help="Split long docs into chunks of up to this many characters")
     p.add_argument("--retries", type=int, default=1, help="Number of additional retries per chunk with fallback models")
     p.add_argument(
@@ -1122,6 +1110,7 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
     p.add_argument("--debug-cooc", action="store_true", help="Enable verbose co-occurrence fallback logging")
     p.add_argument("--no-cluster", action="store_true", help="Disable KGGen-based clustering before persistence")
     p.add_argument("--cluster-model", type=str, default=os.getenv("KG_CLUSTER_MODEL", ""), help="Override model used for clustering (defaults to KG_CLUSTER_MODEL or primary model)")
+    p.add_argument("--llm-timeout", type=int, default=None, help="Timeout (seconds) for each Ollama request (default 120 or OLLAMA_TIMEOUT)")
 
     args = p.parse_args(argv)
     return vars(args)

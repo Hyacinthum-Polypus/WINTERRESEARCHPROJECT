@@ -16,15 +16,19 @@ services:
     image: ghcr.io/berriai/litellm:main-stable
     ports:
       - "4000:4000"
-    environment: 
-      - LITELLM_MASTER_KEY="sk-1234"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-devcontainer}
       - UI_USERNAME=admin
       - UI_PASSWORD=password
       - DATABASE_URL=postgresql://postgres:password@postgres:5432/litellm_db
-      - STORE_MODEL_IN_DB=true
-      # Point LiteLLM to your Ollama server. If Ollama runs on the host, use host.docker.internal
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-    command: --host 0.0.0.0 --port 4000
+      - STORE_MODEL_IN_DB=false
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-https://example.com}
+      - OPENROUTER_APP_NAME=${OPENROUTER_APP_NAME:-Research KG Builder}
+      - OPENROUTER_TIMEOUT=${OPENROUTER_TIMEOUT:-120}
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    command: --host 0.0.0.0 --port 4000 --config /app/config.yaml
     depends_on:
       - postgres
 

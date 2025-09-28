@@ -1,0 +1,24 @@
+# litellm-config.yaml
+general_settings:
+  # good defaults; tweak as needed
+  max_retries: 2
+  timeout: 120
+
+model_list:
+  - model_name: qwen3-14b:free
+    litellm_params:
+      model: "openrouter/qwen/qwen3-14b:free"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: os.environ/OPENROUTER_API_KEY
+      extra_headers:
+        HTTP-Referer: ${OPENROUTER_SITE_URL:-https://example.com}
+        X-Title: "${OPENROUTER_APP_NAME:-Research KG Builder}"
+  - model_name: gpt-oss-120b:free
+    litellm_params:
+      model: "openrouter/openai/gpt-oss-120b:free"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: os.environ/OPENROUTER_API_KEY
+
+router_settings:
+  timeout: 120
+  num_retries: 2
